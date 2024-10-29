@@ -30,7 +30,6 @@ from llm_analysis.constant import *
 from llm_analysis.logger import logger
 from llm_analysis.utils import _latency_to_string, _num_to_string, within_range
 
-
 @total_ordering
 class ActivationRecomputation(Enum):
     NONE = 0
@@ -53,7 +52,6 @@ class ActivationRecomputation(Enum):
             return self.value < other.value
         return NotImplemented
 
-
 @total_ordering
 class DSZeRO(Enum):
     NONE = 0
@@ -74,7 +72,6 @@ class DSZeRO(Enum):
         if self.__class__ is other.__class__:
             return self.value < other.value
         return NotImplemented
-
 
 class LLMAnalysis:
     """Given the specified model, GPU, data type, parallelism
@@ -323,7 +320,7 @@ class LLMAnalysis:
         Returns:
             int: the number of parameters in a transformer layer
         """
-
+        
         return (
             self.get_num_params_per_layer_attn() +
             self.get_num_params_per_layer_mlp() * self.model_config.moe_top_k /
@@ -521,7 +518,6 @@ class LLMAnalysis:
         ) / self.parallelism_config.tp_size
         if ds_zero >= DSZeRO.STAGE_2:
             memory_gradient_last_layernorm /= self.parallelism_config.dp_size
-
         return memory_optimizer_state_last_layernorm, memory_gradient_last_layernorm
 
     def get_memory_embedding(
@@ -855,30 +851,19 @@ class LLMAnalysis:
             layernorm_dtype_bytes,
         )
 
-        if is_inference:
-            activation_memory_per_layer = max(activation_memory_per_layer_attn,
-                                              activation_memory_per_layer_mlp,
-                                              activation_memory_per_layernorm)
-            logger.info(
-                f"activation_memory_per_layer for batch_size {batch_size}:"
-                f" {_num_to_string(activation_memory_per_layer)}B"
-                f" (max(attn, mlp, layernorm): max({_num_to_string(activation_memory_per_layer_attn)}B ,"
-                f" {_num_to_string(activation_memory_per_layer_mlp)}B , 2 *"
-                f" {_num_to_string(2*activation_memory_per_layernorm)}B))")
+        if activation_recomputation == ActivationRecomputation.NORM_ATTN_NORM:
+            activation_memory_layernorm = activation_memory_per_layernorm
         else:
-            if activation_recomputation == ActivationRecomputation.NORM_ATTN_NORM:
-                activation_memory_layernorm = activation_memory_per_layernorm
-            else:
-                activation_memory_layernorm = 2 * activation_memory_per_layernorm
-            activation_memory_per_layer = (activation_memory_per_layer_attn +
-                                           activation_memory_per_layer_mlp +
-                                           activation_memory_layernorm)
-            logger.info(
-                f"activation_memory_per_layer for micro batch size {batch_size} with activation_recomputation {activation_recomputation}:"
-                f" {_num_to_string(activation_memory_per_layer)}B"
-                f" (attn + mlp + layernorm: {_num_to_string(activation_memory_per_layer_attn)}B +"
-                f" {_num_to_string(activation_memory_per_layer_mlp)}B + "
-                f" {_num_to_string(activation_memory_layernorm)}B)")
+            activation_memory_layernorm = 2 * activation_memory_per_layernorm
+        activation_memory_per_layer = (activation_memory_per_layer_attn +
+                                        activation_memory_per_layer_mlp +
+                                        activation_memory_layernorm)
+        logger.info(
+            f"activation_memory_per_layer for micro batch size {batch_size} with activation_recomputation {activation_recomputation}:"
+            f" {_num_to_string(activation_memory_per_layer)}B"
+            f" (attn + mlp + layernorm: {_num_to_string(activation_memory_per_layer_attn)}B +"
+            f" {_num_to_string(activation_memory_per_layer_mlp)}B + "
+            f" {_num_to_string(activation_memory_layernorm)}B)")
         if return_breakdown:
             return activation_memory_per_layer, activation_memory_per_layer_attn, activation_memory_per_layer_mlp, activation_memory_layernorm
         return activation_memory_per_layer
@@ -1090,7 +1075,7 @@ class LLMAnalysis:
             f" {round(weight_memory_latency*1000, 3)} +"
             f" {round(activation_memory_latency*1000, 3)}))")
 
-        return max(compute_latency, memory_latency)
+        return max(compute_latency, memory_latency), compute_latency, memory_latency
 
     def get_latency_fwd_per_layer_mlp_moe_alltoall(self, batch_size: int,
                                                    seq_len: int) -> float:
@@ -1163,7 +1148,7 @@ class LLMAnalysis:
         logger.debug(
             f'alltoall_latency = {round(alltoall_latency*1000, 3)} ms')
 
-        return max(compute_latency, memory_latency) + alltoall_latency
+        return max(compute_latency, memory_latency) + alltoall_latency, compute_latency, memory_latency, alltoall_latency
 
     def get_latency_fwd_per_layernorm(
         self,
@@ -1192,7 +1177,7 @@ class LLMAnalysis:
         )
         activation_memory_latency = activation_memory / (
             self.get_gpu_hbm_bandwidth() * 10**9)
-        return max(compute_latency, activation_memory_latency)
+        return max(compute_latency, activation_memory_latency), compute_latency, activation_memory_latency
 
     def get_latency_fwd_per_tp_comm(self, batch_size: int, seq_len: int,
                                     dtype_bytes: int) -> float:
@@ -1290,18 +1275,48 @@ class LLMAnalysis:
         """
         if ds_zero != ds_zero.NONE:
             assert not is_inference, "DeepSpeed ZeRO is only supported in training"
+            
+        mem_latency=0
+        compute_latency=0
+        comm_latency=0
+        #tot_latency=0
 
-        latency_fwd_per_layer_attn = self.get_latency_fwd_per_layer_attn(
+        latency_fwd_per_layer_attn, compute_latency_attn, memory_latency_attn = self.get_latency_fwd_per_layer_attn(
             batch_size, seq_len, is_inference, activation_recomputation)
+        
+        if compute_latency_attn < memory_latency_attn:
+            mem_latency+=memory_latency_attn
+        else:
+            compute_latency+=compute_latency_attn
+            
+        #tot_latency+=latency_fwd_per_layer_attn
+            
 
-        latency_fwd_per_layer_mlp = self.get_latency_fwd_per_layer_mlp(
+        latency_fwd_per_layer_mlp, compute_latency_mlp, mem_latency_mlp, all2all_comm_latency_mlp = self.get_latency_fwd_per_layer_mlp(
             batch_size, seq_len, is_inference, activation_recomputation)
+        
+        if compute_latency_mlp < mem_latency_mlp:
+            mem_latency += memory_latency_mlp
+        else:
+            compute_latency += compute_latency_mlp
+            
+        comm_latency += all2all_comm_latency_mlp
+        #total_latency += latency_fwd_per_layer_mlp
+            
 
-        latency_fwd_per_layernorm = self.get_latency_fwd_per_layernorm(
+        latency_fwd_per_layernorm, compute_latency_layernorm, memory_latency_layernorm = self.get_latency_fwd_per_layernorm(
             batch_size,
             seq_len,
             layernorm_dtype_bytes,
         )
+        
+        if compute_latency_layernorm < memory_latency_layernorm:
+            mem_latency += 2 * memory_latency_layernorm
+        else:
+            compute_latency += 2 * compute_latency_layernorm
+            
+        #total_latency += 2* latency_fwd_per_layernorm
+        
         logger.debug(
             f"latency_fwd_per_layernorm: {round(latency_fwd_per_layernorm*1000, 3)} ms"
         )
@@ -1311,6 +1326,9 @@ class LLMAnalysis:
             seq_len,
             self.dtype_config.activation_bits / BITS_PER_BYTE,
         )
+        
+        comm_latency += 2 * latency_fwd_per_tp_comm
+        
         logger.debug(
             f"latency_fwd_per_tp_comm: {round(latency_fwd_per_tp_comm*1000, 3)} ms"
         )
@@ -1319,11 +1337,20 @@ class LLMAnalysis:
         )
 
         latency_per_layer = latency_fwd_per_layer_attn + latency_fwd_per_layer_mlp + 2 * latency_fwd_per_layernorm + 2 * latency_fwd_per_tp_comm
+        
+        comm_latency += 2*latency_fwd_per_tp_comm
+        
+
+        compute_ratio = compute_latency / latency_per_layer
+        mem_ratio = mem_latency / latency_per_layer
+        comm_ratio = comm_latency / latency_per_layer
 
         if ds_zero > DSZeRO.STAGE_1 and latency_fwd_per_layer_shared_dp_comm > latency_per_layer:
             logger.warning(
                 f'allgather communication time to unshard model weight {round(latency_fwd_per_layer_shared_dp_comm*1000, 3)} ms is larger than compute {round(latency_per_layer*1000, 3)} ms, thus cannot be fully overlapped.'
             )
+        
+        #print("latency_per_layer: {}, latency_fwd_per_layer_shared_dp_comm: {}".format(latency_per_layer, latency_fwd_per_layer_shared_dp_comm))
         latency_per_layer = max(latency_per_layer,
                                 latency_fwd_per_layer_shared_dp_comm)
 
@@ -1343,7 +1370,7 @@ class LLMAnalysis:
             "sharded_dp_comm": latency_fwd_per_layer_shared_dp_comm
         }
 
-        return latency_per_layer, breakdown_per_layer
+        return latency_per_layer, breakdown_per_layer, compute_latency, compute_ratio, mem_latency, mem_ratio, comm_latency, comm_ratio
 
     def get_latency_fwd_input_embedding(
             self,
@@ -1366,7 +1393,7 @@ class LLMAnalysis:
                           (self.get_gpu_hbm_bandwidth() * 10**9))
         comm_latency = self.get_latency_fwd_per_tp_comm(
             batch_size, seq_len, dtype_bytes)
-        return memory_latency + comm_latency
+        return memory_latency + comm_latency, memory_latency, comm_latency
 
     def get_latency_fwd_output_embedding_loss(self, batch_size: int,
                                               seq_len: int) -> float:
@@ -1420,6 +1447,12 @@ class LLMAnalysis:
         (
             latency_fwd_per_layer,
             breakdown_per_layer,
+            compute_latency,
+            compute_ratio_per_layer,
+            mem_latency,
+            mem_ratio_per_layer,
+            comm_latency,
+            comm_ratio_per_layer
         ) = self.get_latency_fwd_per_layer(
             batch_size,
             seq_len,
@@ -1428,10 +1461,18 @@ class LLMAnalysis:
             layernorm_dtype_bytes,
             ds_zero,
         )
+        
+        #print("per layer: compute ratio: {}, mem ratio: {}, comm ratio: {}".format(compute_ratio_per_layer, mem_ratio_per_layer, comm_ratio_per_layer))
 
         latency_fwd_layers = latency_fwd_per_layer * num_layers_per_gpu
+        
+        compute_latency = compute_latency * num_layers_per_gpu
+        mem_latency = mem_latency * num_layers_per_gpu
+        comm_latency = comm_latency * num_layers_per_gpu
+        
+        #print("total: compute ratio: {}, mem ratio: {}, comm ratio: {}".format(compute_latency/latency_fwd_layers, mem_latency/latency_fwd_layers, comm_latency/latency_fwd_layers))
 
-        latency_fwd_input_embedding = self.get_latency_fwd_input_embedding(
+        latency_fwd_input_embedding, memory_latency_input_embedding, comm_latency_input_embedding = self.get_latency_fwd_input_embedding(
             batch_size,
             seq_len,
             dtype_bytes=self.dtype_config.embedding_bits / BITS_PER_BYTE,
@@ -1442,7 +1483,18 @@ class LLMAnalysis:
 
         latency_fwd = (latency_fwd_layers + latency_fwd_input_embedding +
                        latency_fwd_output_embedding_loss)
-
+        
+        mem_latency += memory_latency_input_embedding
+        comm_latency += comm_latency_input_embedding
+        
+        compute_latency += latency_fwd_output_embedding_loss
+        
+        compute_ratio = compute_latency / latency_fwd
+        mem_ratio = mem_latency / latency_fwd
+        comm_ratio = comm_latency / latency_fwd
+        
+        #print("final compute ratio: {}, mem ratio: {}, comm ratio: {}".format(compute_ratio, mem_ratio, comm_ratio))
+        
         logger.info("latency_fwd_layers:"
                     f" {round(latency_fwd_layers*1000, 3)} ms"
                     f" ({round(latency_fwd_per_layer*1000, 3)} ms x"
@@ -1472,7 +1524,7 @@ class LLMAnalysis:
             breakdown_prefix + "latency_fwd_output_embedding_loss":
             latency_fwd_output_embedding_loss,
         }
-        return latency_fwd, latency_fwd_breakdown
+        return latency_fwd, latency_fwd_breakdown, compute_latency, mem_latency, comm_latency, compute_ratio, mem_ratio, comm_ratio, compute_ratio_per_layer, mem_ratio_per_layer, comm_ratio_per_layer
 
     def get_latency_weight_update(self, ):
         return self.weight_grad_op_state_memory_per_gpu / (
@@ -1540,329 +1592,6 @@ class LLMAnalysis:
                 f"Readable summary written to {os.path.join(output_dir, file_name)}"
             )
 
-    def inference(
-        self,
-        batch_size_per_gpu: int = 1,
-        seq_len: int = 512,
-        num_tokens_to_generate: int = 32,
-        use_kv_cache: bool = True,
-        ds_zero: DSZeRO = DSZeRO.NONE,
-        layernorm_dtype_bytes: int = BYTES_FP16,
-        kv_cache_dtype_bytes: int = None,
-        cost_per_gpu_hour: float = None,
-        output_dir: str = None,
-        output_file_prefix: str = "",
-        output_file_suffix: str = "",
-    ) -> dict:
-        """Inference analysis given the configs and inputs.
-
-        Args:
-            batch_size_per_gpu (int, optional): batch size per gpu. Defaults to 1.
-            seq_len (int, optional): number of input tokens. Defaults to 512.
-            num_tokens_to_generate (int, optional): number of tokens to generate for generative models. Defaults to 32.
-            use_kv_cache (bool, optional): whether to use kv_cache. Defaults to True.
-            ds_zero (DSZeRO, optional): which DeepSpeed ZeRO stage to use. Defaults to DSZeRO.NONE (disabled).
-            layernorm_dtype_bytes (int, optional): number of bytes in the data type for the layernorm activations. Defaults to BYTES_FP32. Often has to be at least FP16 in inference to maintain model accuracy.
-            kv_cache_dtype_bytes (int, optional): number of bytes in the data type for the kv_cache. Defaults to None. Often has to be at least FP16 in inference to maintain model accuracy.
-            cost_per_gpu_hour (float, optional): dollar cost per GPU hour. Defaults to None.
-            output_dir (str, optional): if set to a directory path, write the return summary dict out to the directory with the setup. Defaults to None.
-            output_dir (str, optional): if set to a directory path, write the return summary dict out to the directory with the setup. Defaults to None.
-
-        Returns:
-            dict: a summary dict of the training analysis
-        """
-        if self.model_config.max_seq_len is not None:
-            assert (
-                seq_len <= self.model_config.max_seq_len
-            ), f"seq_len must be less than model max_seq_len ({self.model_config.max_seq_len})"
-
-        self.print_config("Inference Configs")
-
-        logger.info(f"\n{'Analysis'.center(PRINT_LINE_WIDTH, '-')}")
-
-        if kv_cache_dtype_bytes is None:
-            kv_cache_dtype_bytes = (self.dtype_config.activation_bits /
-                                    BITS_PER_BYTE)
-            logger.info(
-                "kv_cache_dtype_bytes not specified, setting to the same as"
-                f" the activation data type : {kv_cache_dtype_bytes}")
-
-        num_layers_per_gpu = int(self.model_config.num_layers /
-                                 self.parallelism_config.pp_size)
-        if self.model_config.num_layers % self.parallelism_config.pp_size:
-            logger.info(
-                "num_layers not be divisible by pp_size, taking the floor")
-
-        weight_memory_embedding_per_gpu = self.get_memory_embedding(ds_zero)
-        weight_memory_layers_per_gpu, weight_memory_attn_per_gpu, weight_memory_mlp_per_gpu, weight_memory_layernorm_per_gpu = [
-            x * num_layers_per_gpu
-            for x in self.get_weight_memory_per_layer(ds_zero,
-                                                      return_breakdown=True)
-        ]
-        weight_memory_last_layernorm = self.get_weight_memory_last_layernorm(
-            ds_zero)
-        weight_memory_per_gpu = (weight_memory_layers_per_gpu +
-                                 weight_memory_embedding_per_gpu +
-                                 weight_memory_last_layernorm)
-
-        memory_left = (self.gpu_config.mem_per_GPU_in_GB * 1024**3 -
-                       weight_memory_per_gpu)
-        assert memory_left > 0, (
-            "model is too large (requiring"
-            f" {_num_to_string(weight_memory_per_gpu)}B) to fit in total GPU"
-            " memory")
-
-        logger.info(
-            f"weight_memory_per_gpu: {_num_to_string(weight_memory_per_gpu)}B"
-            " (embedding + attn + mlp + layernorm:"
-            f" {_num_to_string(weight_memory_embedding_per_gpu)}B + {_num_to_string(weight_memory_attn_per_gpu)}B + {_num_to_string(weight_memory_mlp_per_gpu)}B + {_num_to_string(weight_memory_layernorm_per_gpu)}B), memory_left:"
-            f" {_num_to_string(memory_left)}B")
-
-        # With pipeline parallelism, each stage contains L/p layers so the first stage must store p ×L/p = L layers worth of activations regardless of the pipeline parallel size p; activation memory required for the input embeddings, the last layer-norm, and the output layer are ignored here. Refer to https://arxiv.org/abs/2205.05198 for more details.
-        prefill_activation_memory_per_layer_batch_size_1 = self.get_activation_memory_per_layer(
-            1,
-            seq_len,
-            is_inference=True,
-            layernorm_dtype_bytes=layernorm_dtype_bytes,
-        )
-        prefill_activation_memory_output_embedding_batch_size_1 = self.get_activation_memory_output_embedding(
-            1, seq_len)
-
-        prefill_activation_memory_batch_size_1 = max(
-            prefill_activation_memory_per_layer_batch_size_1,
-            prefill_activation_memory_output_embedding_batch_size_1)
-
-        prefill_max_batch_size_per_gpu = int(
-            memory_left / prefill_activation_memory_batch_size_1)
-        logger.info(
-            f"prefill_activation_memory_batch_size_1: {_num_to_string(prefill_activation_memory_batch_size_1)}B,"
-            " prefill_max_batch_size_per_gpu:"
-            f" {prefill_max_batch_size_per_gpu}")
-
-        prefill_activation_memory_per_layer = self.get_activation_memory_per_layer(
-            batch_size_per_gpu,
-            seq_len,
-            is_inference=True,
-            layernorm_dtype_bytes=layernorm_dtype_bytes,
-        )
-        prefill_activation_memory_output_embedding = self.get_activation_memory_output_embedding(
-            batch_size_per_gpu, seq_len)
-        prefill_activation_memory_per_gpu = max(
-            prefill_activation_memory_per_layer,
-            prefill_activation_memory_output_embedding)
-
-        logger.info("prefill_activation_memory_per_gpu with batch_size_per_gpu"
-                    f" {batch_size_per_gpu}:"
-                    f" {_num_to_string(prefill_activation_memory_per_gpu)}B")
-        assert memory_left > prefill_activation_memory_per_gpu, (
-            "prefill activation memory is too large with batch_size_per_gpu ="
-            f" {batch_size_per_gpu} to fit in GPU memory(requiring"
-            f" {_num_to_string(prefill_activation_memory_per_gpu)}B),"
-            " memory_left after fitting in model weights:"
-            f" {_num_to_string(memory_left)}B, prefill_max_batch_size_per_gpu:"
-            f" {prefill_max_batch_size_per_gpu}")
-
-        prefill_num_flops_fwd_total = self.get_num_flops_fwd_total(
-            batch_size_per_gpu, seq_len)
-        logger.info(
-            "prefill_num_flops_fwd_total:"
-            f" {_num_to_string(prefill_num_flops_fwd_total, divisor=1000)}")
-
-        prefill_latency, prefill_latency_breakdown = self.get_latency_fwd(
-            batch_size_per_gpu,
-            seq_len,
-            is_inference=True,
-            layernorm_dtype_bytes=layernorm_dtype_bytes,
-            breakdown_prefix="prefill_",
-        )
-
-        if use_kv_cache:
-            if (batch_size_per_gpu *
-                (seq_len + num_tokens_to_generate) < self.get_pivot()):
-                logger.warning(
-                    "kv_cache is only useful when batch_size *"
-                    " (seq+num_tokens_to_generate)"
-                    f" ({batch_size_per_gpu * (seq_len+num_tokens_to_generate)}) is larger"
-                    f" than ({round(self.get_pivot(), 3)}), which is the pivot"
-                    " point")
-            kv_cache_memory_per_gpu = self.get_memory_kv_cache_per_layer(
-                batch_size_per_gpu,
-                seq_len + num_tokens_to_generate,
-                kv_cache_dtype_bytes=kv_cache_dtype_bytes,
-            ) * num_layers_per_gpu
-
-            # load and store kv cache
-            kv_cache_latency = (2 * kv_cache_memory_per_gpu /
-                                (self.get_gpu_hbm_bandwidth() * 10**9))
-
-            decode_activation_memory_per_layer = self.get_activation_memory_per_layer(
-                batch_size_per_gpu,
-                1,
-                is_inference=True,
-                layernorm_dtype_bytes=layernorm_dtype_bytes,
-            )
-            decode_activation_memory_output_embedding = self.get_activation_memory_output_embedding(
-                batch_size_per_gpu, 1)
-            decode_activation_memory_per_gpu = max(
-                decode_activation_memory_per_layer,
-                decode_activation_memory_output_embedding)
-
-            logger.info(
-                "kv_cache_memory_per_gpu:"
-                f" {_num_to_string(kv_cache_memory_per_gpu)}B,"
-                " decode_activation_memory_per_gpu:"
-                f" {_num_to_string(decode_activation_memory_per_gpu)}B")
-
-            decode_max_batch_size_per_gpu = int(
-                memory_left /
-                ((decode_activation_memory_per_gpu + kv_cache_memory_per_gpu) /
-                 batch_size_per_gpu))
-            assert memory_left > (
-                kv_cache_memory_per_gpu + decode_activation_memory_per_gpu
-            ), ("kv_cache and activation memory with batch_size_per_gpu ="
-                f" {batch_size_per_gpu} is too large to fit in GPU memory"
-                " (requiring"
-                f" {_num_to_string((kv_cache_memory_per_gpu + decode_activation_memory_per_gpu))}B),"
-                " memory_left after fitting in model weights:"
-                f" {_num_to_string(memory_left)}B,"
-                " decode_max_batch_size_per_gpu:"
-                f" {decode_max_batch_size_per_gpu}")
-        else:
-            decode_max_batch_size_per_gpu = int(
-                memory_left / prefill_activation_memory_batch_size_1)
-            logger.info("decode_activation_memory_batch_size_1:"
-                        f" {prefill_activation_memory_batch_size_1},"
-                        " decode_max_batch_size_per_gpu:"
-                        f" {decode_max_batch_size_per_gpu}")
-
-            assert batch_size_per_gpu <= decode_max_batch_size_per_gpu, (
-                f"batch_size_per_gpu {batch_size_per_gpu} is too large to fit"
-                " in GPU memory, decode_max_batch_size_per_gpu:"
-                f" {decode_max_batch_size_per_gpu}")
-
-            decode_activation_memory_per_layer = (
-                self.get_activation_memory_per_layer(
-                    batch_size_per_gpu,
-                    seq_len + num_tokens_to_generate,
-                    is_inference=True,
-                    layernorm_dtype_bytes=layernorm_dtype_bytes,
-                ))
-            decode_activation_memory_per_gpu = (
-                decode_activation_memory_per_layer)
-            kv_cache_memory_per_gpu = 0
-            kv_cache_latency = 0
-
-        decode_num_flops_fwd_total = self.get_num_flops_fwd_total(
-            batch_size_per_gpu,
-            1 if use_kv_cache else (seq_len + num_tokens_to_generate) // 2,
-        )
-        logger.info(
-            "decode_num_flops_fwd_total:"
-            f" {_num_to_string(decode_num_flops_fwd_total, divisor=1000)}")
-
-        decode_latency, decode_latency_breakdown = self.get_latency_fwd(
-            batch_size_per_gpu,
-            1 if use_kv_cache else (seq_len + num_tokens_to_generate) // 2,
-            is_inference=True,
-            layernorm_dtype_bytes=layernorm_dtype_bytes,
-            breakdown_prefix="decode_",
-        )
-
-        if use_kv_cache:
-            decode_latency += kv_cache_latency
-
-        total_decode_latency = decode_latency * num_tokens_to_generate
-        total_per_token_latency = (
-            prefill_latency + total_decode_latency) / num_tokens_to_generate
-
-        decode_tokens_per_sec = batch_size_per_gpu * 1 / decode_latency
-        prefill_tokens_per_sec = batch_size_per_gpu * seq_len / prefill_latency
-        total_tokens_per_sec = batch_size_per_gpu / total_per_token_latency
-
-        summary_dict = {
-            "batch_size_per_gpu": batch_size_per_gpu,
-            "seq_len": seq_len,
-            "tp_size": self.parallelism_config.tp_size,
-            "ep_size": self.parallelism_config.ep_size,
-            "pp_size": self.parallelism_config.pp_size,
-            "num_tokens_to_generate": num_tokens_to_generate,
-            "num_params_total": self.total_num_params,
-            "num_params_total_mlp": self.total_num_params_mlp,
-            "num_params_total_embedding": self.total_num_params_embedding,
-            "num_params_total_others": self.total_num_params_others,
-            "num_active_params_total": self.total_num_active_params,
-            "flops_efficiency": self.flops_efficiency,
-            "hbm_memory_efficiency": self.hbm_memory_efficiency,
-            "layernorm_dtype_bytes": layernorm_dtype_bytes,
-            "use_kv_cache": use_kv_cache,
-            "kv_cache_latency": kv_cache_latency,
-            "kv_cache_memory_per_gpu": kv_cache_memory_per_gpu,
-            "weight_memory_per_gpu": weight_memory_per_gpu,
-            "weight_memory_embedding_per_gpu": weight_memory_embedding_per_gpu,
-            "prefill_activation_memory_per_gpu":
-            prefill_activation_memory_per_gpu,
-            "prefill_max_batch_size_per_gpu": prefill_max_batch_size_per_gpu,
-            "prefill_num_flops_fwd_total": prefill_num_flops_fwd_total,
-            "decode_activation_memory_per_gpu":
-            decode_activation_memory_per_gpu,
-            "decode_max_batch_size_per_gpu": decode_max_batch_size_per_gpu,
-            "decode_activation_memory_per_gpu":
-            decode_activation_memory_per_gpu,
-            "decode_num_flops_fwd_total": decode_num_flops_fwd_total,
-            "prefill_latency": prefill_latency,
-        }
-
-        summary_dict.update(prefill_latency_breakdown)
-        summary_dict.update({
-            "decode_latency": decode_latency,
-        })
-        summary_dict.update(decode_latency_breakdown)
-        summary_dict.update({
-            "total_decode_latency":
-            total_decode_latency,
-            "total_latency":
-            prefill_latency + decode_latency * num_tokens_to_generate,
-            "total_per_token_latency":
-            total_per_token_latency,
-        })
-
-        summary_dict.update({
-            "prefill_tokens_per_sec": prefill_tokens_per_sec,
-            "decode_tokens_per_sec": decode_tokens_per_sec,
-            "total_tokens_per_sec": total_tokens_per_sec,
-        })
-
-        if cost_per_gpu_hour:
-            num_gpus = self.parallelism_config.pp_size * self.parallelism_config.tp_size
-
-            def compute_cost_per_1k_tokens(tokens_per_sec):
-                return 1000 * cost_per_gpu_hour * num_gpus / 3600 / tokens_per_sec
-
-            prefill_cost_per_1k_tokens = compute_cost_per_1k_tokens(
-                prefill_tokens_per_sec)
-            decode_cost_per_1k_tokens = compute_cost_per_1k_tokens(
-                decode_tokens_per_sec)
-            total_cost_per_1k_tokens = compute_cost_per_1k_tokens(
-                total_tokens_per_sec)
-            summary_dict.update({
-                "prefill_cost_per_1k_tokens":
-                prefill_cost_per_1k_tokens,
-                "decode_cost_per_1k_tokens":
-                decode_cost_per_1k_tokens,
-                "total_cost_per_1k_tokens":
-                total_cost_per_1k_tokens
-            })
-
-        logger.info(self.get_readable_summary_dict(summary_dict))
-
-        if output_dir is not None:
-            self.output_summary_dict(summary_dict,
-                                     output_dir,
-                                     print_human_readable=True,
-                                     output_file_prefix=output_file_prefix,
-                                     output_file_suffix=output_file_suffix)
-
-        return summary_dict
 
     def config_batch_size_and_gradient_accumulation_steps(
         self,
@@ -1896,6 +1625,7 @@ class LLMAnalysis:
             # gradient_accumulation_steps is None, the other two are not None
             gradient_accumulation_steps = global_batch_size // (
                 batch_size_per_gpu * dp_size)
+            print("gradient_accumulation_steps: ", gradient_accumulation_steps)
             assert (global_batch_size % (batch_size_per_gpu * dp_size) == 0
                     and gradient_accumulation_steps > 0
                     ), "no valid gradient_accumulation_steps, {assert_msg}"
@@ -2020,10 +1750,10 @@ class LLMAnalysis:
 
         self.print_config("Training Configs")
 
-        if ds_zero == DSZeRO.NONE:
-            logger.warning(
-                f"DeepSpeed ZeRO is disabled, consider using ZeRO to reduce memory usage"
-            )
+        #if ds_zero == DSZeRO.NONE:
+        #    logger.warning(
+        #        f"DeepSpeed ZeRO is disabled, consider using ZeRO to reduce memory usage"
+        #    )
 
         logger.info(f"\n{'Analysis'.center(PRINT_LINE_WIDTH, '-')}")
 
@@ -2202,6 +1932,7 @@ class LLMAnalysis:
                 seq_len,
                 layernorm_dtype_bytes,
             )
+            
             logger.info(
                 f"activation_memory_per_gpu with micro batch size {batch_size_per_gpu}: {_num_to_string(activation_memory_per_gpu)}B (attn + mlp + layernorm + input_embed + output_embed: {_num_to_string(activation_memory_attn_per_gpu)}B + {_num_to_string(activation_memory_mlp_per_gpu)}B + {_num_to_string(activation_memory_layernorm_per_gpu)}B + {_num_to_string(activation_memory_input_embedding_per_gpu)}B + {_num_to_string(activation_memory_output_embedding_per_gpu)}B)"
             )
@@ -2213,10 +1944,16 @@ class LLMAnalysis:
             logger.warning(
                 "activation_memory_per_gpu memory or loss_bwd_memory is too large with batch_size_per_gpu ="
                 f" {batch_size_per_gpu} to fit in GPU memory (requiring"
-                f" activation_memory_per_gpu={_num_to_string(activation_memory_per_gpu)}B, loss_bwd_memory={_num_to_string(loss_bwd_memory)}Bmemory_left after"
+                f" activation_memory_per_gpu={_num_to_string(activation_memory_per_gpu)}B, loss_bwd_memory={_num_to_string(loss_bwd_memory)}B memory_left after"
                 " fitting in model weights, gradients, and optimizer states ="
                 f" {_num_to_string(memory_left)}B, max_batch_size_per_gpu ="
                 f" {max_batch_size_per_gpu})")
+            
+        max_consum = activation_memory_per_gpu + max(
+                estimated_prefetch_memory_per_gpu, loss_bwd_memory) + self.weight_grad_op_state_memory_per_gpu
+        
+        max_consum_ratio = max_consum / (self.gpu_config.mem_per_GPU_in_GB * 1024**3)
+        print("max_consum: {} max_consum_ratio: {}".format(max_consum, max_consum_ratio))
 
         memory_left = memory_left - activation_memory_per_gpu - max(
             estimated_prefetch_memory_per_gpu, loss_bwd_memory)
@@ -2259,7 +1996,8 @@ class LLMAnalysis:
         )
         latency_per_iter_using_flops = latency_per_micro_batch_using_flops * gradient_accumulation_steps
 
-        latency_fwd, latency_fwd_breakdown = self.get_latency_fwd(
+        latency_fwd, latency_fwd_breakdown, compute_latency, mem_latency, comm_latency, compute_ratio, mem_ratio, comm_ratio, compute_ratio_per_layer, mem_ratio_per_layer, comm_ratio_per_layer = \
+            self.get_latency_fwd(
             batch_size_per_gpu,
             seq_len,
             is_inference=False,
@@ -2268,39 +2006,83 @@ class LLMAnalysis:
             ds_zero=ds_zero,
         )
 
-        latency_fwd_per_layer_attn_compute = self.get_latency_fwd_per_layer_attn(
+        latency_fwd_per_layer_attn_compute, compute_latency_attn, mem_latency_attn = self.get_latency_fwd_per_layer_attn(
             batch_size_per_gpu, seq_len, False, activation_recomputation)
-        latency_fwd_per_layer_mlp_compute = self.get_latency_fwd_per_layer_mlp(
+        latency_fwd_per_layer_mlp_compute, compute_latency_mlp, mem_latency_mlp, all2all_latency_mlp = self.get_latency_fwd_per_layer_mlp(
             batch_size_per_gpu, seq_len, False, activation_recomputation)
-        latency_fwd_per_layernorm_compute = self.get_latency_fwd_per_layernorm(
+        latency_fwd_per_layernorm_compute, compute_latency_layernorm, mem_latency_layernorm = self.get_latency_fwd_per_layernorm(
             batch_size_per_gpu,
             seq_len,
             layernorm_dtype_bytes,
         )
+        
         num_layers_per_gpu = int(self.model_config.num_layers /
                                  self.parallelism_config.pp_size)
+        
         if activation_recomputation == ActivationRecomputation.FULL:
             latency_recompute = num_layers_per_gpu * (
                 latency_fwd_per_layer_attn_compute +
                 latency_fwd_per_layer_mlp_compute +
                 2 * latency_fwd_per_layernorm_compute)
+            
+            if compute_latency_attn > mem_latency_attn:
+                compute_latency += num_layers_per_gpu * compute_latency_attn
+            else:
+                mem_latency += num_layers_per_gpu * mem_latency_attn
+                
+            if compute_latency_mlp > mem_latency_mlp:
+                compute_latency += num_layers_per_gpu * compute_latency_mlp
+            else:
+                mem_latency += num_layers_per_gpu * mem_latency_mlp
+                
+            comm_latency += num_layers_per_gpu * all2all_latency_mlp
+            
+            if compute_latency_layernorm > mem_latency_layernorm:
+                compute_latency += num_layers_per_gpu * 2*compute_latency_layernorm
+            else:
+                mem_latency += num_layers_per_gpu * 2*mem_latency_layernorm
+                
         elif activation_recomputation == ActivationRecomputation.NORM_ATTN_NORM:
             latency_recompute = num_layers_per_gpu * (
                 latency_fwd_per_layer_attn_compute +
                 2 * latency_fwd_per_layernorm_compute)
+            
+            if compute_latency_attn > mem_latency_attn:
+                compute_latency += num_layers_per_gpu * compute_latency_attn
+            else:
+                mem_latency += num_layers_per_gpu * mem_latency_attn
+                   
+            if compute_latency_layernorm > mem_latency_layernorm:
+                compute_latency += num_layers_per_gpu * 2 * compute_latency_layernorm
+            else:
+                mem_latency += num_layers_per_gpu * 2*mem_latency_layernorm
+            
         elif activation_recomputation == ActivationRecomputation.ATTN:
             latency_recompute = num_layers_per_gpu * latency_fwd_per_layer_attn_compute
+            
+            if compute_latency_attn > mem_latency_attn:
+                compute_latency += num_layers_per_gpu * compute_latency_attn
+            else:
+                mem_latency += num_layers_per_gpu * mem_latency_attn
+                
         elif activation_recomputation == ActivationRecomputation.ATTN_COMPUTE:
             latency_recompute = num_layers_per_gpu * self.get_num_flops_total_attn_compute(
                 batch_size_per_gpu, seq_len) / (
                     (self.parallelism_config.tp_size *
                      self.parallelism_config.pp_size) *
                     self.get_TFLOPS_per_gpu() * 1e12)
+            #FIXME how to add compute, mem, comm latency
         elif activation_recomputation == ActivationRecomputation.NONE:
             latency_recompute = 0
 
         latency_per_micro_batch = latency_fwd * 3 + latency_recompute
-        latency_weight_update = self.get_latency_weight_update()
+        
+        compute_per_micro_batch_ratio = compute_latency / latency_per_micro_batch
+        mem_per_micro_batch_ratio = mem_latency / latency_per_micro_batch
+        comm_per_micro_batch_ratio = comm_latency / latency_per_micro_batch
+        
+        latency_weight_update = self.get_latency_weight_update() #FIXME memory-bound?
+        
         latency_per_iter = (
             latency_per_micro_batch * gradient_accumulation_steps +
             latency_weight_update)
@@ -2348,7 +2130,6 @@ class LLMAnalysis:
                         f"total_training_latency_using_flops ({total_training_latency_using_flops}) is too"
                         " different from estimated_total_training_latency"
                         f" ({estimated_total_training_latency})")
-
         else:
             total_training_latency = None
             total_training_latency_using_flops = None
@@ -2468,10 +2249,22 @@ class LLMAnalysis:
             optimizer_state_memory_per_gpu + weight_memory_per_gpu +
             max(activation_memory_per_gpu, gradient_memory_per_gpu) +
             max(estimated_bwd_prefetch_memory_per_gpu, loss_bwd_memory),
+            "memory_left":
+            memory_left,
             "latency_per_micro_batch":
             latency_per_micro_batch,
             "latency_fwd":
             latency_fwd,
+            "compute_ratio":
+            compute_per_micro_batch_ratio,
+            "mem_ratio":
+            mem_per_micro_batch_ratio,
+            "comm_ratio":
+            comm_per_micro_batch_ratio,
+            "max_mem_consum_ratio":
+            max_consum_ratio,
+            "latency_per_iter":
+            latency_per_iter
         }
         summary_dict.update(latency_fwd_breakdown)
         device_tokens_per_sec = round(
@@ -2498,117 +2291,11 @@ class LLMAnalysis:
         return summary_dict
 
 
-def infer(
-    model_name="facebook_opt-1.3b",
-    gpu_name="a100-sxm-40gb",
-    dtype_name="w16a16e16",
-    log_level="INFO",
-    batch_size_per_gpu=1,
-    ds_zero: int = 0,
-    dp_size: int = 1,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    sp_size: int = None,
-    seq_len=512,
-    num_tokens_to_generate=32,
-    use_kv_cache: bool = True,
-    layernorm_dtype_bytes: int = BYTES_FP16,
-    kv_cache_dtype_bytes: int = None,
-    achieved_tflops: float = None,
-    achieved_memory_bandwidth_GBs: float = None,
-    flops_efficiency: float = None,
-    hbm_memory_efficiency: float = None,
-    intra_node_memory_efficiency=INTRA_NODE_MEMORY_EFFICIENCY,
-    inter_node_memory_efficiency=INTER_NODE_MEMORY_EFFICIENCY,
-    cost_per_gpu_hour: float = None,
-    output_dir: str = None,
-    output_file_prefix: str = "",
-    output_file_suffix: str = "",
-) -> dict:
-    """_summary_
-
-    Args:
-        model_name (str, optional): model name to query the pre-defined `model_configs` dict, or model config json file path, if not found, query Hugging Face to construct ModelConfig. Defaults to "facebook_opt-1.3b".
-        gpu_name (str, optional): gpu name to query the pre-defined `gpu_configs` dict. Defaults to "a100-sxm-40gb".
-        dtype_name (str, optional): data type name to pre-defined `dtype_configs` dict. Defaults to "w16a16e16".
-        log_level (str, optional): logging level. Defaults to "INFO".
-        batch_size_per_gpu (int, optional): batch size per GPU. Defaults to 1.
-        ds_zero (int, optional): which DeepSpeed ZeRO stage to use. See `DSZeRO`. Defaults to 0.
-        dp_size (int, optional): data parallelism size. Defaults to None.
-        tp_size (int, optional): tensor parallelism size. Defaults to 1.
-        pp_size (int, optional): pipeline parallelism size. Defaults to 1.
-        sp_size (int, optional): sequence parallelism size. Defaults to tp_size.
-        seq_len (int, optional): input sequence length. Defaults to 512.
-        num_tokens_to_generate (int, optional): number of tokens to generate for generative models. Defaults to 32.
-        use_kv_cache (bool, optional): whether to use kv cache. Defaults to True.
-        layernorm_dtype_bytes (int, optional): number of bytes in the data type for the layernorm activations. Defaults to BYTES_FP32. Often has to be at least FP16 in inference to maintain model accuracy.
-        kv_cache_dtype_bytes (int, optional): number of bytes in the data type for the kv_cache. Defaults to None. Often has to be at least FP16 in inference to maintain model accuracy.
-        achieved_tflops (float, optional): achieved TFLOPS per GPU. If specified, will override the flops_efficiency passed in. Defaults to None.
-        achieved_memory_bandwidth_GBs (float, optional): achieved GPU memory bandwidth in GB/s. If specified, will override the hbm_memory_efficiency passed in. Defaults to None.
-        flops_efficiency (float, optional): flops efficiency, ranging from 0 to 1. Defaults to None.
-        hbm_memory_efficiency (float, optional): GPU HBM memory efficiency, ranging from 0 to 1. Defaults to HBM_MEMORY_EFFICIENCY.
-        intra_node_memory_efficiency (float, optional):  intra-node memory efficiency, ranging from 0 to 1. Defaults to INTRA_NODE_MEMORY_EFFICIENCY.
-        inter_node_memory_efficiency (float, optional):  inter-node memory efficiency, ranging from 0 to 1. Defaults to INTER_NODE_MEMORY_EFFICIENCY.
-        cost_per_gpu_hour (float, optional): dollar cost per GPU hour. Defaults to None.
-        output_dir (str, optional): if set to a directory path, write the return summary dict out to the directory with the setup. Defaults to None.. Defaults to None.
-        output_file_prefix (str, optional): prefix of the output file. Defaults to "".
-        output_file_suffix (str, optional): suffix of the output file. Defaults to "".
-
-    Returns:
-        dict: a summary dictionary of the inference analysis
-    """
-
-    model_config = get_model_config_by_name(model_name)
-    gpu_config = get_gpu_config_by_name(gpu_name)
-    dtype_config = get_dtype_config_by_name(dtype_name)
-    parallel_config = ParallelismConfig(
-        tp_size=tp_size,
-        pp_size=pp_size,
-        sp_size=sp_size if sp_size else tp_size,
-        dp_size=dp_size)
-
-    logger.setLevel(logging.getLevelName(log_level))
-
-    analysis = LLMAnalysis(
-        model_config,
-        gpu_config,
-        dtype_config,
-        parallel_config,
-        achieved_tflops=achieved_tflops,
-        achieved_memory_bandwidth_GBs=achieved_memory_bandwidth_GBs,
-        flops_efficiency=flops_efficiency,
-        hbm_memory_efficiency=hbm_memory_efficiency,
-        intra_node_memory_efficiency=intra_node_memory_efficiency,
-        inter_node_memory_efficiency=inter_node_memory_efficiency,
-    )
-
-    if analysis.hbm_memory_efficiency > 0.8:
-        logger.warning(
-            "Note that benchmarks show closer to 0.6-0.7 hbm_memory_efficiency in inference workloads"
-        )
-
-    summary_dict = analysis.inference(
-        batch_size_per_gpu=batch_size_per_gpu,
-        seq_len=seq_len,
-        num_tokens_to_generate=num_tokens_to_generate,
-        use_kv_cache=use_kv_cache,
-        ds_zero=DSZeRO(ds_zero),
-        layernorm_dtype_bytes=layernorm_dtype_bytes,
-        kv_cache_dtype_bytes=kv_cache_dtype_bytes,
-        cost_per_gpu_hour=cost_per_gpu_hour,
-        output_dir=output_dir,
-        output_file_prefix=output_file_prefix,
-        output_file_suffix=output_file_suffix,
-    )
-
-    return summary_dict
-
-
 def train(
     model_name="facebook_opt-1.3b",
     gpu_name="a100-sxm-40gb",
     dtype_name="w16a16e16",
-    log_level="INFO",
+    log_level="WARNING", #"INFO",
     batch_size_per_gpu: int = None,
     gradient_accumulation_steps: int = None,
     global_batch_size: int = None,
@@ -2695,7 +2382,7 @@ def train(
         " and is best kept within a single node where high bandwidth NVLink"
         " is available.")
 
-    rdp_size = 1
+    rdp_size = 1 
     if total_num_gpus and dp_size:
         assert total_num_gpus % (
             dp_size * tp_size * pp_size

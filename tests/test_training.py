@@ -25,7 +25,7 @@ TOLERANCE = 0.05
 def test_training_megatron_lm_1():
     model_name = "facebook_opt-175b"
     dtype_name = "w16a16e16"
-    gpu_name = "a100-sxm-40gb"
+    gpu_name = "a100-sxm-80gb"
     total_num_tokens = 300e9
 
     activation_recomputation = ActivationRecomputation.FULL
@@ -66,6 +66,8 @@ def test_training_megatron_lm_1():
         summary_dict["total_training_latency_using_flops"]) == "84.82 days")
 
     assert _num_to_string(summary_dict["num_params_total"]) == "162.58 G"
+
+    print(summary_dict)
 
 
 # megatron-lm paper https://arxiv.org/abs/2104.04473 Table 2
@@ -325,3 +327,5 @@ def test_training_mt_nlg_2():
 
     assert _latency_to_string(
         summary_dict["latency_per_iter_using_flops"]) == "49.98 s"
+
+test_training_megatron_lm_1()

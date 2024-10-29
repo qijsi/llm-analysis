@@ -325,6 +325,21 @@ def populate_model_and_gpu_configs() -> None:
     logger.info(
         f"Populated {len(model_configs)} model configs, {len(gpu_configs)} gpu configs, {len(dtype_configs)} dtype configs"
     )
+    
+def get_model_configs() -> ModelConfig:
+    return read_configs(Path(__file__).parent /
+                                 Path(MODEL_CONFIG_DIR_NAME),
+                                 type="model")
+    
+def get_gpu_configs() -> GPUConfig:
+    return read_configs(Path(__file__).parent /
+                               Path(GPU_CONFIG_DIR_NAME),
+                               type="gpu")
+    
+def get_dtype_configs() -> DtypeConfig:
+    return read_configs(Path(__file__).parent /
+                                 Path(DTYPE_CONFIG_DIR_NAME),
+                                 type="dtype")
 
 
 def list_model_configs() -> None:

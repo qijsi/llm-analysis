@@ -44,10 +44,10 @@ fmt = "%(levelname)-6s [%(filename)s:%(lineno)d] %(message)s"
 
 stdout_handler = logging.StreamHandler()
 stdout_handler.setFormatter(CustomFormatter(fmt))
+stdout_handler.setLevel(logging.WARNING)
 
 logger = logging.getLogger("__name__")
 logger.addHandler(stdout_handler)
-
 
 def get_current_level():
     """Return logger's current log level."""
