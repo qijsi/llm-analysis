@@ -1493,7 +1493,7 @@ class LLMAnalysis:
         mem_ratio = mem_latency / latency_fwd
         comm_ratio = comm_latency / latency_fwd
         
-        #print("final compute ratio: {}, mem ratio: {}, comm ratio: {}".format(compute_ratio, mem_ratio, comm_ratio))
+        print("final compute ratio: {}, mem ratio: {}, comm ratio: {}".format(compute_ratio, mem_ratio, comm_ratio))
         
         logger.info("latency_fwd_layers:"
                     f" {round(latency_fwd_layers*1000, 3)} ms"
@@ -1711,6 +1711,7 @@ class LLMAnalysis:
         output_dir: str = None,
         output_file_prefix: str = "",
         output_file_suffix: str = "",
+        debug: bool = False
     ) -> dict:
         """Training analysis given the configs and inputs.
 
@@ -1812,19 +1813,19 @@ class LLMAnalysis:
             f"weight_memory_per_gpu: {_num_to_string(weight_memory_per_gpu)}B (embedding_memory: {_num_to_string(weight_memory_embedding_per_gpu)}B), optimizer_state_memory_per_gpu: {_num_to_string(optimizer_state_memory_per_gpu)}B, gradient_memory_per_gpu: {_num_to_string(gradient_memory_per_gpu)}B, estimated_fwd_prefetch_memory_per_gpu: {_num_to_string(estimated_fwd_prefetch_memory_per_gpu)}B, estimated_bwd_prefetch_memory_per_gpu: {_num_to_string(estimated_bwd_prefetch_memory_per_gpu)}B"
         )
 
-        if memory_left < 0:
+        if memory_left < 0 and debug:
             logger.warning(
                 "model weight/optimizer state memory usage is too large to fit in GPU memory"
             )
 
         if memory_left - max(estimated_prefetch_memory_per_gpu,
-                             gradient_memory_per_gpu) < 0:
+                             gradient_memory_per_gpu) < 0 and debug:
             logger.warning(
                 "model gradient or bwd prefetch memory usage is too large to fit in GPU memory"
             )
 
         loss_bwd_memory_batch_size_1 = self.get_loss_bwd_memory(1, seq_len)
-        if memory_left - loss_bwd_memory_batch_size_1 < 0:
+        if memory_left - loss_bwd_memory_batch_size_1 < 0 and debug:
             logger.warning("loss_bwd_memory is too large to fit in GPU memory")
 
         # With pipeline parallelism, each stage contains L/p layers so the first stage must store p ×L/p = L layers worth of activations regardless of the pipeline parallel size p; activation memory required for the input embeddings, the last layer-norm, and the output layer are ignored here. Refer to https://arxiv.org/abs/2205.05198 for more details.
@@ -1866,14 +1867,14 @@ class LLMAnalysis:
 
         if memory_left - max(
                 estimated_prefetch_memory_per_gpu,
-                loss_bwd_memory_batch_size_1) < activation_memory_batch_size_1:
+                loss_bwd_memory_batch_size_1) < activation_memory_batch_size_1 and debug:
             logger.warning(
                 f"memory_left {_num_to_string(memory_left)} < activation_memory_batch_size_1 {_num_to_string(activation_memory_batch_size_1)}"
             )
-
-        logger.info(
-            f"activation_memory_per_gpu with micro batch size 1: {_num_to_string(activation_memory_batch_size_1)}B (attn + mlp + layernorm + input_embed + output_embed: {_num_to_string(attn_activation_memory_batch_size_1)}B + {_num_to_string(mlp_activation_memory_batch_size_1)}B + {_num_to_string(layernorm_activation_memory_batch_size_1)}B + {_num_to_string(activation_memory_input_embedding_batch_size_1)}B + {_num_to_string(activation_memory_output_embedding_batch_size_1)}B)"
-        )
+        if debug:
+            logger.info(
+                f"activation_memory_per_gpu with micro batch size 1: {_num_to_string(activation_memory_batch_size_1)}B (attn + mlp + layernorm + input_embed + output_embed: {_num_to_string(attn_activation_memory_batch_size_1)}B + {_num_to_string(mlp_activation_memory_batch_size_1)}B + {_num_to_string(layernorm_activation_memory_batch_size_1)}B + {_num_to_string(activation_memory_input_embedding_batch_size_1)}B + {_num_to_string(activation_memory_output_embedding_batch_size_1)}B)"
+            )
 
         max_batch_size_per_gpu = int(memory_left //
                                      activation_memory_batch_size_1)
@@ -1883,8 +1884,9 @@ class LLMAnalysis:
         ) + activation_memory_batch_size_1 * max_batch_size_per_gpu:
             max_batch_size_per_gpu -= 1
 
-        logger.info(
-            f"max_batch_size_per_gpu: {max_batch_size_per_gpu}, estimated_prefetch_memory_per_gpu: {_num_to_string(estimated_prefetch_memory_per_gpu)}B, loss_bwd_memory: {_num_to_string(self.get_loss_bwd_memory(max_batch_size_per_gpu, seq_len))}B"
+        if debug:
+            logger.info(
+                f"max_batch_size_per_gpu: {max_batch_size_per_gpu}, estimated_prefetch_memory_per_gpu: {_num_to_string(estimated_prefetch_memory_per_gpu)}B, loss_bwd_memory: {_num_to_string(self.get_loss_bwd_memory(max_batch_size_per_gpu, seq_len))}B"
         )
 
         (
@@ -1933,14 +1935,15 @@ class LLMAnalysis:
                 layernorm_dtype_bytes,
             )
             
-            logger.info(
-                f"activation_memory_per_gpu with micro batch size {batch_size_per_gpu}: {_num_to_string(activation_memory_per_gpu)}B (attn + mlp + layernorm + input_embed + output_embed: {_num_to_string(activation_memory_attn_per_gpu)}B + {_num_to_string(activation_memory_mlp_per_gpu)}B + {_num_to_string(activation_memory_layernorm_per_gpu)}B + {_num_to_string(activation_memory_input_embedding_per_gpu)}B + {_num_to_string(activation_memory_output_embedding_per_gpu)}B)"
-            )
+            if debug:
+                logger.info(
+                    f"activation_memory_per_gpu with micro batch size {batch_size_per_gpu}: {_num_to_string(activation_memory_per_gpu)}B (attn + mlp + layernorm + input_embed + output_embed: {_num_to_string(activation_memory_attn_per_gpu)}B + {_num_to_string(activation_memory_mlp_per_gpu)}B + {_num_to_string(activation_memory_layernorm_per_gpu)}B + {_num_to_string(activation_memory_input_embedding_per_gpu)}B + {_num_to_string(activation_memory_output_embedding_per_gpu)}B)"
+                )
 
         loss_bwd_memory = self.get_loss_bwd_memory(batch_size_per_gpu, seq_len)
 
         if memory_left < activation_memory_per_gpu + max(
-                estimated_prefetch_memory_per_gpu, loss_bwd_memory):
+                estimated_prefetch_memory_per_gpu, loss_bwd_memory) and debug:
             logger.warning(
                 "activation_memory_per_gpu memory or loss_bwd_memory is too large with batch_size_per_gpu ="
                 f" {batch_size_per_gpu} to fit in GPU memory (requiring"
@@ -1953,7 +1956,7 @@ class LLMAnalysis:
                 estimated_prefetch_memory_per_gpu, loss_bwd_memory) + self.weight_grad_op_state_memory_per_gpu
         
         max_consum_ratio = max_consum / (self.gpu_config.mem_per_GPU_in_GB * 1024**3)
-        print("max_consum: {} max_consum_ratio: {}".format(max_consum, max_consum_ratio))
+        print("max_consum: {} max_consum_ratio: {}".format(max_consum/1024**3, max_consum_ratio))
 
         memory_left = memory_left - activation_memory_per_gpu - max(
             estimated_prefetch_memory_per_gpu, loss_bwd_memory)
@@ -1971,7 +1974,7 @@ class LLMAnalysis:
         elif activation_recomputation == ActivationRecomputation.ATTN_COMPUTE:
             num_flops_recompute = self.get_num_flops_total_attn_compute(
                 batch_size_per_gpu, seq_len)
-            if num_flops_recompute < 0.05 * num_flops_fwd_total:
+            if num_flops_recompute < 0.05 * num_flops_fwd_total and debug:
                 logger.warning(
                     f"num_flops_recompute ({num_flops_recompute}) is too large to"
                     " ignore")
@@ -1981,11 +1984,12 @@ class LLMAnalysis:
         num_flops_total_per_micro_batch = (num_flops_fwd_total +
                                            num_flops_bwd_total +
                                            num_flops_recompute)
-        logger.info(
-            "num_flops_total_per_micro_batch:"
-            f" {_num_to_string(num_flops_total_per_micro_batch, divisor=1000)} ({_num_to_string(num_flops_fwd_total, divisor=1000)} fwd"
-            f" + {_num_to_string(num_flops_bwd_total, divisor=1000)} bwd +"
-            f" {_num_to_string(num_flops_recompute, divisor=1000)} recompute)")
+        if debug:
+            logger.info(
+                "num_flops_total_per_micro_batch:"
+                f" {_num_to_string(num_flops_total_per_micro_batch, divisor=1000)} ({_num_to_string(num_flops_fwd_total, divisor=1000)} fwd"
+                f" + {_num_to_string(num_flops_bwd_total, divisor=1000)} bwd +"
+                f" {_num_to_string(num_flops_recompute, divisor=1000)} recompute)")
 
         # estimated by flops only:
         latency_per_micro_batch_using_flops = num_flops_total_per_micro_batch / (
@@ -2086,14 +2090,14 @@ class LLMAnalysis:
         latency_per_iter = (
             latency_per_micro_batch * gradient_accumulation_steps +
             latency_weight_update)
-
-        logger.info(
-            f"latency_per_micro_batch: {round(latency_per_micro_batch * 1000, 3)} ms ({round(latency_fwd * 1000, 3)} latency_fwd * 3 + {round(latency_recompute * 1000, 3)} latency_recompute)"
-        )
-        logger.info(
-            f"latency_per_iter: {round(latency_per_iter * 1000, 3)} ms "
-            f"({round(latency_per_micro_batch * 1000, 3)} ms latency_per_micro_batch * {gradient_accumulation_steps} gradient_accumulation_steps + {round(latency_weight_update * 1000, 3)} ms weight_update)"
-        )
+        if debug:
+            logger.info(
+                f"latency_per_micro_batch: {round(latency_per_micro_batch * 1000, 3)} ms ({round(latency_fwd * 1000, 3)} latency_fwd * 3 + {round(latency_recompute * 1000, 3)} latency_recompute)"
+            )
+            logger.info(
+                f"latency_per_iter: {round(latency_per_iter * 1000, 3)} ms "
+                f"({round(latency_per_micro_batch * 1000, 3)} ms latency_per_micro_batch * {gradient_accumulation_steps} gradient_accumulation_steps + {round(latency_weight_update * 1000, 3)} ms weight_update)"
+            )
 
         total_num_gpus = (self.parallelism_config.tp_size *
                           self.parallelism_config.pp_size *
@@ -2101,7 +2105,7 @@ class LLMAnalysis:
                           self.parallelism_config.rdp_size)
 
         if total_num_tokens is not None:
-            if total_num_tokens < 20 * self.total_num_params:
+            if total_num_tokens < 20 * self.total_num_params and debug:
                 logger.warning(
                     "according to the Chinchilla paper"
                     " (https://arxiv.org/abs/2203.15556), to train a"
@@ -2125,7 +2129,7 @@ class LLMAnalysis:
                     self.total_num_params * total_num_tokens /
                     (total_num_gpus * self.get_TFLOPS_per_gpu() * 1e12))
                 if not within_range(total_training_latency_using_flops,
-                                    estimated_total_training_latency, 0.05):
+                                    estimated_total_training_latency, 0.05) and debug:
                     logger.warning(
                         f"total_training_latency_using_flops ({total_training_latency_using_flops}) is too"
                         " different from estimated_total_training_latency"
